@@ -183,6 +183,13 @@ class WorkerLoRAManager(AbstractWorkerManager):
 
         return lora
 
+    def get_dummy_lora_warmup_rank(self, default_rank: int) -> int:
+        # Patch: delegate to underlying model adapter manager (vLLM 0.21 API compat shim).
+        m = getattr(self, "_adapter_manager", None)
+        if m is not None and hasattr(m, "get_dummy_lora_warmup_rank"):
+            return m.get_dummy_lora_warmup_rank(default_rank)
+        return default_rank
+
     def add_dummy_lora(self, lora_request: LoRARequest, rank: int) -> bool:
         if lora_request.lora_int_id in self.list_adapters():
             return False

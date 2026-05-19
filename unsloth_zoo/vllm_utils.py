@@ -1119,8 +1119,61 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+        elif hasattr(layer, "linear_attn"):
+            # Patch: Qwen3.5 GDN layer. vLLM fuses qkv+z into in_proj_qkvz and b+a into in_proj_ba;
+            # HF stores in_proj_qkv, in_proj_z, in_proj_b, in_proj_a separately. Split them here.
+            gdn = layer.linear_attn
+            gdn_prefix = f"{vllm_text_model_prefix}.layers.{kk}.linear_attn"
 
-        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+            qkvz = gdn.in_proj_qkvz
+            qkvz_w = qkvz.weight.data
+            qkvz_sizes = qkvz.output_sizes  # [key_dim, key_dim, value_dim, value_dim]
+            qkvz_off = [0] + list(np.cumsum(qkvz_sizes))
+            qkv_w = qkvz_w[qkvz_off[0]:qkvz_off[3]].contiguous()
+            z_w = qkvz_w[qkvz_off[3]:qkvz_off[4]].contiguous()
+            state_dict[f"{gdn_prefix}.in_proj_qkv.weight"] = qkv_w
+            state_dict[f"{gdn_prefix}.in_proj_z.weight"] = z_w
+            quant_state_dict[f"{gdn_prefix}.in_proj_qkv.weight"] = qkv_w
+            quant_state_dict[f"{gdn_prefix}.in_proj_z.weight"] = z_w
+
+            ba = gdn.in_proj_ba
+            ba_w = ba.weight.data
+            ba_sizes = ba.output_sizes  # [num_v_heads, num_v_heads]
+            ba_off = [0] + list(np.cumsum(ba_sizes))
+            b_w = ba_w[ba_off[0]:ba_off[1]].contiguous()
+            a_w = ba_w[ba_off[1]:ba_off[2]].contiguous()
+            state_dict[f"{gdn_prefix}.in_proj_b.weight"] = b_w
+            state_dict[f"{gdn_prefix}.in_proj_a.weight"] = a_w
+            quant_state_dict[f"{gdn_prefix}.in_proj_b.weight"] = b_w
+            quant_state_dict[f"{gdn_prefix}.in_proj_a.weight"] = a_w
+
+            out_w = gdn.out_proj.weight.data
+            state_dict[f"{gdn_prefix}.out_proj.weight"] = out_w
+            quant_state_dict[f"{gdn_prefix}.out_proj.weight"] = out_w
+
+            conv_w = gdn.conv1d.weight.data
+            state_dict[f"{gdn_prefix}.conv1d.weight"] = conv_w
+            quant_state_dict[f"{gdn_prefix}.conv1d.weight"] = conv_w
+            if getattr(gdn.conv1d, "bias", None) is not None:
+                conv_b = gdn.conv1d.bias.data
+                state_dict[f"{gdn_prefix}.conv1d.bias"] = conv_b
+                quant_state_dict[f"{gdn_prefix}.conv1d.bias"] = conv_b
+
+            # Parameters (no .weight suffix)
+            state_dict[f"{gdn_prefix}.A_log"] = gdn.A_log.data
+            quant_state_dict[f"{gdn_prefix}.A_log"] = gdn.A_log.data
+            state_dict[f"{gdn_prefix}.dt_bias"] = gdn.dt_bias.data
+            quant_state_dict[f"{gdn_prefix}.dt_bias"] = gdn.dt_bias.data
+
+            state_dict[f"{gdn_prefix}.norm.weight"] = gdn.norm.weight.data
+            quant_state_dict[f"{gdn_prefix}.norm.weight"] = gdn.norm.weight.data
+
+            prefix = None
+        else:
+            prefix = None
+
+        if prefix is not None:
+            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
         proj = layer.mlp.gate_up_proj
         use_fused_gate_up = _is_fused_module("gate_up_proj")
@@ -1300,6 +1353,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         "norm1",              # Qwen2.5-VL vision encoder
         "norm2",              # Qwen2.5-VL vision encoder
         "norm",
+        # Patch: Qwen3.5 GDN conv1d (3D weight; treat as in-place weight assignment)
+        "conv1d",
     ]
     # Override .to("cuda") to disable it otherwise we'll get
     # ValueError: Blockwise quantization only supports 16/32-bit floats, but got torch.uint8
@@ -1352,9 +1407,15 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
-                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
+                # Patch: try without stripping "model." first (Qwen3.5: new_model.model.language_model.*).
+                # Fall back to stripped form for older VLM layouts.
+                full_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
+                stripped_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
                 layer = torch.nn.Parameter(weight, requires_grad = False)
-                exec(f"new_model.{layer_name_br} = layer")
+                try:
+                    exec(f"new_model.{full_br} = layer")
+                except AttributeError:
+                    exec(f"new_model.{stripped_br} = layer")
                 continue
             elif fp8_weight_scale is not None:
                 if fp8_weight_scale.ndim == 1:
@@ -2280,6 +2341,9 @@ def load_vllm(
             print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
         pass
     pass
+
+    # Patch: force enforce_eager to dodge vLLM torch.compile bug (size_1 erase)
+    engine_args["enforce_eager"] = True
 
     # Quick exit
     if return_args: return engine_args

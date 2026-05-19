@@ -400,7 +400,11 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
 
 @torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
-    if hasattr(new_model, "language_model"):
+    # Patch: Qwen3.5 VLM has new_model.model.language_model nesting.
+    if hasattr(new_model, "model") and hasattr(new_model.model, "language_model") and not hasattr(new_model, "language_model"):
+        language_model = new_model.model.language_model
+        language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "language_model"):
         language_model = new_model.language_model
         language_model_prefix = "model.language_model"
     else:
@@ -529,6 +533,19 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.mlp.up_proj",
             "model.language_model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.language_model.layers.{kk}.mlp.down_proj",
+
+            # Patch: Qwen3.5 GDN (linear_attn) Linear submodules
+            "model.language_model.layers.{kk}.linear_attn.in_proj_qkv",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_z",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_b",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_a",
+            "model.language_model.layers.{kk}.linear_attn.out_proj",
+            # Conv1d (3D weight) and norm get handled by layernorm path (in-place weight set)
+            "model.language_model.layers.{kk}.linear_attn.conv1d",
+            "model.language_model.layers.{kk}.linear_attn.norm",
+            # Parameters (no .weight suffix)
+            "model.language_model.layers.{kk}.linear_attn.A_log",
+            "model.language_model.layers.{kk}.linear_attn.dt_bias",
 
             "model.layers.{kk}.self_attn.q_proj",
             "model.layers.{kk}.self_attn.k_proj",
