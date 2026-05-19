@@ -2120,15 +2120,18 @@ def load_vllm(
     elif memory_left_for_kv_cache_gb >  80: max_num_batched_tokens, approx_max_num_seqs = 8192, 256 # + 16
 
     if is_vision_model:
-        # In vLLM profiling, each sequence contributes to an image. Which is generally in the order of thousand tokens.
-        # We don't want to go beyond 16 sequences for vision models.
-        # TODO: In vLLM V1, iirc, the profiling sets a cap on the max seqs based on the budget. Check it out.
-        print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
-        # [TODO] Check this
-        approx_max_num_seqs = 1
-        # Single image would contribute to 6404 tokens in Llama 3.2 for eg. So have some more for text
-        # For qwen 2.5 VL, this single image/video contributes to 16Ki tokens
-        max_num_batched_tokens = max(8192, max_seq_length)
+        # Patch: text-only mode (e.g. GRPO on Qwen3.5 with no images) — keep the
+        # large default approx_max_num_seqs so rollouts can batch in parallel.
+        if os.environ.get("UNSLOTH_VLLM_TEXT_ONLY") in ("1", "true", "yes"):
+            print(f'Unsloth: Vision model detected but UNSLOTH_VLLM_TEXT_ONLY=1 -- keeping approx_max_num_seqs={approx_max_num_seqs}')
+            max_num_batched_tokens = max(max_num_batched_tokens, max_seq_length)
+        else:
+            # In vLLM profiling, each sequence contributes to an image. Which is generally in the order of thousand tokens.
+            print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
+            approx_max_num_seqs = 1
+            # Single image would contribute to 6404 tokens in Llama 3.2 for eg.
+            # For qwen 2.5 VL, this single image/video contributes to 16Ki tokens
+            max_num_batched_tokens = max(8192, max_seq_length)
 
     # float8 KV cache can fit more sequences in 1 go so more throughput
     if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
